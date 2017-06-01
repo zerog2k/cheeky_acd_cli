@@ -7,6 +7,7 @@ import webbrowser
 import datetime
 import random
 import string
+import uuid
 from requests.auth import AuthBase
 from urllib.parse import urlparse, parse_qs
 from threading import Lock
@@ -15,28 +16,24 @@ logger = logging.getLogger(__name__)
 
 TOKEN_INFO_URL = 'https://api.amazon.com/auth/o2/tokeninfo'
 
+# Fuck you Amazon you massive twats.
+APP_ID = "YW16bjEuYXBwbGljYXRpb24tb2EyLWNsaWVudC40YTY0NzZkODljYTA0NDQ3OGY3MTI3MDZiN2VjYzYwNA"
+APP_NAME = "Amazon Drive"
+APP_VERSION = "4.0.13.d2a5aec4"
 
 def create_handler(path: str):
-    from .common import RequestError
+    return CheekyOAuthHandler(path)
 
-    try:
-        return LocalOAuthHandler(path)
-    except (KeyError, RequestError, KeyboardInterrupt, EOFError, SystemExit):
-        raise
-    except:
-        pass
-    return AppspotOAuthHandler(path)
-
-
-class OAuthHandler(AuthBase):
+class CheekyOAuthHandler(AuthBase):
+    """An OAuth handler that does some cheeky bullshit to make acd_cli work again."""
     OAUTH_DATA_FILE = 'oauth.json'
+    AMAZON_OA_TOKEN_URL = 'https://api.amazon.com/auth/token'
 
     class KEYS(object):
         EXP_IN = 'expires_in'
         ACC_TOKEN = 'access_token'
         REFR_TOKEN = 'refresh_token'
         EXP_TIME = 'exp_time'  # manually added
-        REDIRECT_URI = 'redirect_uri'  # only for local
 
     def __init__(self, path):
         self.path = path
@@ -45,9 +42,19 @@ class OAuthHandler(AuthBase):
         self.init_time = time.time()
         self.lock = Lock()
 
+        self.load_oauth_data()
+        logger.info('%s initialized.' % self.__class__.__name__)
+
     def __call__(self, r: requests.Request):
         with self.lock:
-            r.headers['Authorization'] = self.get_auth_token()
+            r.headers.update(
+                {
+                    "Accept": "application/json",
+                    "x-amz-access-token": self.get_auth_token(),
+                    "x-amz-clouddrive-appid": APP_ID,
+                    "x-amzn-RequestId": str(uuid.uuid4()),
+                }
+            )
         return r
 
     @property
@@ -117,7 +124,7 @@ class OAuthHandler(AuthBase):
                 self.refresh_auth_token()
             else:
                 logger.info('Externally updated token found in oauth file.')
-        return "Bearer " + self.oauth_data[self.KEYS.ACC_TOKEN]
+        return self.oauth_data[self.KEYS.ACC_TOKEN]
 
     def write_oauth_data(self):
         """Dumps (treated) OAuth dict to file as JSON."""
@@ -140,12 +147,40 @@ class OAuthHandler(AuthBase):
             pass
 
     def refresh_auth_token(self):
-        """Fetches a new access token using the refresh token."""
-        raise NotImplementedError
+        """Fetches a new access token using a refresh token."""
+        logger.info('Refreshing authentication token.')
+
+        data = {
+            "app_name": APP_NAME,
+            "app_version": APP_VERSION,
+            "requested_token_type": "access_token",
+            "source_token": self.oauth_data[self.KEYS.REFR_TOKEN],
+            "source_token_type": "refresh_token",
+        }
+
+        from .common import RequestError
+
+        t = time.time()
+        try:
+            response = requests.post(self.AMAZON_OA_TOKEN_URL, data=data)
+        except ConnectionError as e:
+            logger.critical('Error refreshing authentication token.')
+            raise RequestError(RequestError.CODE.CONN_EXCEPTION, e.__str__())
+
+        if response.status_code != requests.codes.ok:
+            raise RequestError(RequestError.CODE.REFRESH_FAILED,
+                               'Error refreshing authentication token: %s' % response.text)
+
+        response_json = response.json()
+        response_json[self.KEYS.REFR_TOKEN] = self.oauth_data[self.KEYS.REFR_TOKEN]
+        self.oauth_data = self.validate(json.dumps(response_json))
+        self.treat_auth_token(t)
+        self.write_oauth_data()
 
     def check_oauth_file_exists(self):
         """Checks for OAuth file existence and one-time initialize if necessary. Throws on error."""
-        raise NotImplementedError
+        if not os.path.isfile(self.oauth_data_path):
+            raise RuntimeError("The OAuth configuration does not exist. You must create it first.")
 
     def get_access_token_info(self) -> dict:
         """
@@ -157,158 +192,3 @@ class OAuthHandler(AuthBase):
         r = requests.get(TOKEN_INFO_URL,
                          params={'access_token': self.oauth_data['access_token']})
         return r.json()
-
-
-class AppspotOAuthHandler(OAuthHandler):
-    APPSPOT_URL = 'https://acd-api-oa.appspot.com/'
-
-    def __init__(self, path):
-        super().__init__(path)
-        self.load_oauth_data()
-
-        logger.info('%s initialized' % self.__class__.__name__)
-
-    def check_oauth_file_exists(self):
-        """Checks for existence of oauth token file and instructs user to visit
-        the Appspot page if it was not found.
-
-        :raises: FileNotFoundError if oauth file was not placed into cache directory"""
-
-        if os.path.isfile(self.oauth_data_path):
-            return
-
-        input('For the one-time authentication a browser (tab) will be opened at %s.\n'
-              % AppspotOAuthHandler.APPSPOT_URL + 'Please accept the request and ' +
-              'save the plaintext response data into a file called "%s" ' % self.OAUTH_DATA_FILE +
-              'in the directory "%s".\nPress a key to open a browser.\n' % self.path)
-        webbrowser.open_new_tab(AppspotOAuthHandler.APPSPOT_URL)
-
-        input('Press a key if you have saved the "%s" file into "%s".\n'
-              % (self.OAUTH_DATA_FILE, self.path))
-
-        with open(self.oauth_data_path):
-            pass
-
-    def refresh_auth_token(self):
-        """:raises: RequestError"""
-
-        logger.info('Refreshing authentication token.')
-
-        ref = {self.KEYS.REFR_TOKEN: self.oauth_data[self.KEYS.REFR_TOKEN]}
-        t = time.time()
-
-        from .common import RequestError, ConnectionError
-
-        try:
-            response = requests.post(self.APPSPOT_URL, data=ref)
-        except ConnectionError as e:
-            logger.critical('Error refreshing authentication token.')
-            raise RequestError(RequestError.CODE.CONN_EXCEPTION, e.__str__())
-
-        if response.status_code != requests.codes.ok:
-            raise RequestError(RequestError.CODE.REFRESH_FAILED,
-                               'Error refreshing authentication token: %s' % response.text)
-
-        r = self.validate(response.text)
-
-        self.oauth_data = r
-        self.treat_auth_token(t)
-        self.write_oauth_data()
-
-
-class LocalOAuthHandler(OAuthHandler):
-    """A local OAuth handler that works with a whitelisted security profile.
-    The profile must not be created prior to June 2015. Profiles created prior to this month
-    are not able to use the new scope "clouddrive:read_all" that replaces "clouddrive:read".
-    https://developer.amazon.com/public/apis/experience/cloud-drive/content/getting-started"""
-
-    CLIENT_DATA_FILE = 'client_data'
-
-    AMAZON_OA_LOGIN_URL = 'https://amazon.com/ap/oa'
-    AMAZON_OA_TOKEN_URL = 'https://api.amazon.com/auth/o2/token'
-    REDIRECT_URI = 'http://localhost'
-
-    def __init__(self, path):
-        super().__init__(path)
-
-        self.client_data = {}
-
-        self.client_id = lambda: self.client_data.get('CLIENT_ID')
-        self.client_secret = lambda: self.client_data.get('CLIENT_SECRET')
-
-        self.OAUTH_ST1 = lambda: {'client_id': self.client_id(),
-                                  'response_type': 'code',
-                                  'scope': 'clouddrive:read_all clouddrive:write',
-                                  'redirect_uri': self.REDIRECT_URI}
-
-        self.OAUTH_ST2 = lambda: {'grant_type': 'authorization_code',
-                                  'code': None,
-                                  'client_id': self.client_id(),
-                                  'client_secret': self.client_secret(),
-                                  'redirect_uri': self.REDIRECT_URI}
-
-        self.OAUTH_REF = lambda: {'grant_type': 'refresh_token',
-                                  'refresh_token': None,
-                                  'client_id': self.client_id(),
-                                  'client_secret': self.client_secret(),
-                                  'redirect_uri': self.REDIRECT_URI}
-
-        self.load_client_data()
-        self.load_oauth_data()
-
-        logger.info('%s initialized.' % self.__class__.__name__)
-
-    def load_client_data(self):
-        """:raises: IOError if client data file was not found
-        :raises: KeyError if client data file has missing key(s)"""
-
-        cdp = os.path.join(self.path, self.CLIENT_DATA_FILE)
-        with open(cdp) as cd:
-            self.client_data = json.load(cd)
-
-        if self.client_id() == '' or self.client_secret() == '':
-            logger.critical('Client ID or client secret empty or key absent.')
-            raise KeyError
-
-    def check_oauth_file_exists(self):
-        """:raises: Exception"""
-        if not os.path.isfile(self.oauth_data_path):
-            from urllib.parse import urlencode
-
-            url = self.AMAZON_OA_LOGIN_URL + '?' + urlencode(self.OAUTH_ST1())
-            webbrowser.open_new_tab(url)
-            print('A window will have opened at %s' % url)
-            ret_url = input('Please log in or accept '
-                            'and enter the URL you have been redirected to: ')
-            ret_q = parse_qs(urlparse(ret_url).query)
-
-            st2 = self.OAUTH_ST2()
-            st2['code'] = ret_q['code'][0]
-
-            response = requests.post(self.AMAZON_OA_TOKEN_URL, data=st2)
-            self.oauth_data = self.validate(response.text)
-            self.write_oauth_data()
-
-    def refresh_auth_token(self):
-        """:raises: RequestError"""
-        logger.info('Refreshing authentication token.')
-
-        ref = self.OAUTH_REF()
-        ref[self.KEYS.REFR_TOKEN] = self.oauth_data[self.KEYS.REFR_TOKEN]
-
-        from .common import RequestError
-
-        t = time.time()
-        try:
-            response = requests.post(self.AMAZON_OA_TOKEN_URL, data=ref)
-        except ConnectionError as e:
-            logger.critical('Error refreshing authentication token.')
-            raise RequestError(RequestError.CODE.CONN_EXCEPTION, e.__str__())
-
-        if response.status_code != requests.codes.ok:
-            raise RequestError(RequestError.CODE.REFRESH_FAILED,
-                               'Error refreshing authentication token: %s' % response.text)
-
-        self.oauth_data = self.validate(response.text)
-        self.treat_auth_token(t)
-        self.write_oauth_data()
