@@ -64,7 +64,7 @@ try:
         requests.utils.old_dau = requests.utils.default_user_agent
 
         def new_dau():
-            return __name__ + '/' + __version__ + ' ' + requests.utils.old_dau()
+            return "CloudDriveWin/4.0.13.d2a5aec4"
 
         requests.utils.default_user_agent = new_dau
 except:
