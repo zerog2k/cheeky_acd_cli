@@ -30,7 +30,7 @@ setup(
     name='acdcli',
     version=version,
     description='a command line interface and FUSE filesystem for Amazon Cloud Drive',
-    long_description=re.sub(repl[0], repl[1], read('README.rst')),
+    long_description='a command line interface and FUSE filesystem for Amazon Cloud Drive',
     license='GPLv2+',
     author='yadayada',
     author_email='acd_cli@mail.com',
