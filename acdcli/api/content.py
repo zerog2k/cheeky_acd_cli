@@ -20,23 +20,61 @@ logger = logging.getLogger(__name__)
 class _TeeBufferedReader(object):
     """Proxy buffered reader object that allows callbacks on read operations."""
 
-    def __init__(self, file: io.BufferedReader, callbacks: list = None):
+    def __init__(self, file: io.BufferedReader, callbacks: list = None, special: bool = False):
         self._file = file
         self._callbacks = callbacks
+        self._special = special
+        # get filesize
+        self._file.seek(0, os.SEEK_END)
+        self._filesize = self._file.tell()
+        self._file.seek(0)
+        if special:
+            self._special_bytes = self.__gen_gif_header()
+            self._special_size = len(self._special_bytes)
+            self._special_sent = 0
+            self._filesize += self._special_size
+        self.len = self._filesize
 
+    def tell(self):
+        t = self._file.tell()
+        if self._special:
+            # fake offset
+            t += self._special_sent
+        return t
+    
     def __getattr__(self, item):
         try:
             return object.__getattr__(item)
         except AttributeError:
-            return getattr(self._file, item)
+            return getattr(self._file, item)    
 
     def read(self, ln=-1):
         #ln = ln if ln in (0, -1) else FS_RW_CHUNK_SZ
-        chunk = self._file.read(ln)
+        if self._special and (self._special_sent < self._special_size):
+            sent = self._special_sent
+            size = self._special_size
+            # prepend special bytes
+            if ln > size:
+                # requested read larger than header size
+                chunk = self._special_bytes
+                self._special_sent = self._special_size
+                chunk += self._file.read(ln-size)
+            else:
+                # requested read smaller than special 
+                chunk = self._special_bytes[sent:sent+ln]
+                self._special_sent += ln
+        else:     
+            chunk = self._file.read(ln)
         for callback in self._callbacks or []:
             callback(chunk)
         return chunk
-
+    
+    def __gen_gif_header(self):
+        HEADER_SIZE = 512
+        BASE_GIF = "47494638 39610100 01008001 00000000 FFFFFF21 F9040100 0001002C 00000000 01000100 0002024C 01003B00 00000000"
+        header = bytearray.fromhex(BASE_GIF)
+        header.extend([0] * (HEADER_SIZE - len(header)))
+        return header
 
 def _tee_open(path: str, **kwargs) -> _TeeBufferedReader:
     f = open(path, 'rb')
@@ -114,7 +152,7 @@ class ContentMixin(object):
         return r.json()
 
     def upload_file(self, file_name: str, parent: str = None,
-                    read_callbacks=None, deduplication=False) -> dict:
+                    read_callbacks=None, deduplication=False, special: bool = False) -> dict:
         params = {'suppress': 'deduplication'}
         if deduplication and os.path.getsize(file_name) > 0:
             params = {}
@@ -124,7 +162,7 @@ class ContentMixin(object):
         if parent:
             metadata['parents'] = [parent]
         mime_type = _get_mimetype(basename)
-        f = _tee_open(file_name, callbacks=read_callbacks)
+        f = _tee_open(file_name, callbacks=read_callbacks, special=special)
 
         m = MultipartEncoder(fields=OrderedDict([('metadata', json.dumps(metadata)),
                                                  ('content', ('filename', f, mime_type))]))

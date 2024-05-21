@@ -387,7 +387,7 @@ def overwrite_timeout(initial_node: dict, path: str, hash_: str, size_: int, rsf
     return UL_TIMEOUT
 
 
-def download_complete(node: 'Node', path: str, hash_: str, rsf: bool):
+def download_complete(node: 'Node', path: str, hash_: str, rsf: bool, special: bool = False):
     md5_match = compare_hashes(node.md5, hash_, node.name)
     if md5_match != 0:
         if not conf.getboolean('download', 'keep_corrupt'):
@@ -399,6 +399,20 @@ def download_complete(node: 'Node', path: str, hash_: str, rsf: bool):
     size_match = compare_sizes(node.size, os.path.getsize(path), path)
     if size_match != 0:
         return size_match
+
+    if special:
+        # strip header out
+        # hacky, but easier to do after we have downloaded & verified
+        print("stripping special header")
+        newpath = path + ".new"
+        with open(path, 'rb') as infile, open(newpath, 'wb') as outfile:
+            infile.seek(512) # skip header
+            while True:
+                buf = infile.read(4096)
+                if not buf:
+                    break
+                outfile.write(buf)
+        os.rename(newpath, path)
 
     if rsf:
         try:
@@ -416,7 +430,7 @@ def download_complete(node: 'Node', path: str, hash_: str, rsf: bool):
 
 
 def create_upload_jobs(dirs: list, path: str, parent_id: str, overwr: bool, force: bool,
-                       dedup: bool, rsf: bool, exclude: list, exclude_paths: list, jobs: list) \
+                       dedup: bool, rsf: bool, exclude: list, exclude_paths: list, jobs: list, special: bool) \
         -> int:
     """Creates upload job if passed path is a file, delegates directory traversal otherwise.
     Detects soft links that link to an already queued directory.
@@ -450,7 +464,7 @@ def create_upload_jobs(dirs: list, path: str, parent_id: str, overwr: bool, forc
                 return 0
 
         prog = progress.FileProgress(os.path.getsize(path))
-        fo = partial(upload_file, path, parent_id, overwr, force, dedup, rsf, pg_handler=prog)
+        fo = partial(upload_file, path, parent_id, overwr, force, dedup, rsf, pg_handler=prog, special=special)
         jobs.append(fo)
         return 0
 
@@ -510,7 +524,7 @@ def traverse_ul_dir(dirs: list, directory: str, parent_id: str, overwr: bool, fo
 
 @retry_on(STD_RETRY_RETVALS)
 def upload_file(path: str, parent_id: str, overwr: bool, force: bool, dedup: bool, rsf: bool,
-                pg_handler: progress.FileProgress = None) -> RetryRetVal:
+                pg_handler: progress.FileProgress = None, special: bool = False) -> RetryRetVal:
     short_nm = os.path.basename(path)
 
     if dedup and cache.file_size_exists(os.path.getsize(path)):
@@ -547,10 +561,12 @@ def upload_file(path: str, parent_id: str, overwr: bool, force: bool, dedup: boo
         logger.info('Uploading %s' % path)
         hasher = hashing.IncrementalHasher()
         local_size = os.path.getsize(path)
+        if special:
+            local_size += 512
         try:
             r = acd_client.upload_file(path, parent_id,
                                        read_callbacks=[hasher.update, pg_handler.update],
-                                       deduplication=dedup)
+                                       deduplication=dedup, special=special)
         except RequestError as e:
             if e.status_code == 409:  # might happen if cache is outdated
                 if not dedup:
@@ -663,7 +679,7 @@ def upload_stream(stream, file_name, parent_id, overwr=False, dedup=False,
 
 
 def create_dl_jobs(node_id: str, local_path: str, preserve_mtime: bool, rsf: bool,
-                   exclude: 'List[re._pattern_type]', jobs: list) -> int:
+                   exclude: 'List[re._pattern_type]', jobs: list, special: bool = False) -> int:
     """Appends download partials for folder/file node pointed to by *node_id*
     to the **jobs** list."""
 
@@ -674,7 +690,7 @@ def create_dl_jobs(node_id: str, local_path: str, preserve_mtime: bool, rsf: boo
         return 0
 
     if node.is_folder:
-        return traverse_dl_folder(node, local_path, preserve_mtime, rsf, exclude, jobs)
+        return traverse_dl_folder(node, local_path, preserve_mtime, rsf, exclude, jobs, special=special)
 
     loc_name = node.name
 
@@ -692,14 +708,14 @@ def create_dl_jobs(node_id: str, local_path: str, preserve_mtime: bool, rsf: boo
         return 0
 
     prog = progress.FileProgress(node.size)
-    fo = partial(download_file, node_id, local_path, preserve_mtime, rsf, pg_handler=prog)
+    fo = partial(download_file, node_id, local_path, preserve_mtime, rsf, pg_handler=prog, special = special)
     jobs.append(fo)
 
     return 0
 
 
 def traverse_dl_folder(node: 'Node', local_path: str, preserve_mtime: bool, rsf: bool,
-                       exclude: 'List[re._pattern_type', jobs: list) -> int:
+                       exclude: 'List[re._pattern_type', jobs: list, special: bool = False) -> int:
     """Duplicates remote folder structure."""
 
     if not local_path:
@@ -721,15 +737,15 @@ def traverse_dl_folder(node: 'Node', local_path: str, preserve_mtime: bool, rsf:
     folders, files = sorted(folders), sorted(files)
 
     for file in files:
-        ret_val |= create_dl_jobs(file.id, curr_path, preserve_mtime, rsf, exclude, jobs)
+        ret_val |= create_dl_jobs(file.id, curr_path, preserve_mtime, rsf, exclude, jobs, special=special)
     for folder in folders:
-        ret_val |= traverse_dl_folder(folder, curr_path, preserve_mtime, rsf, exclude, jobs)
+        ret_val |= traverse_dl_folder(folder, curr_path, preserve_mtime, rsf, exclude, jobs, special=special)
     return ret_val
 
 
 @retry_on(DL_RETRY_RETVALS)
 def download_file(node_id: str, local_path: str, preserve_mtime: bool, rsf: bool,
-                  pg_handler: progress.FileProgress = None) -> RetryRetVal:
+                  pg_handler: progress.FileProgress = None, special: bool = False) -> RetryRetVal:
     node = cache.get_node(node_id)
     name, md5, size = node.name, node.md5, node.size
 
@@ -747,7 +763,7 @@ def download_file(node_id: str, local_path: str, preserve_mtime: bool, rsf: bool
             mtime = datetime_to_timestamp(node.modified)
             os.utime(os.path.join(local_path, name), (mtime, mtime))
 
-        return download_complete(node, os.path.join(local_path, name), hasher.get_result(), rsf)
+        return download_complete(node, os.path.join(local_path, name), hasher.get_result(), rsf, special=special)
 
 
 #
@@ -893,7 +909,7 @@ def upload_action(args: argparse.Namespace) -> int:
 
         ret_val |= create_upload_jobs([], path, args.parent, args.overwrite, args.force,
                                       args.deduplicate, args.remove_source_files,
-                                      excl_re, args.exclude_path, jobs)
+                                      excl_re, args.exclude_path, jobs, special=args.special)
 
     ql = QueuedLoader(args.max_connections, args.print_progress, max_retries=args.max_retries)
     ql.add_jobs(jobs)
@@ -936,7 +952,7 @@ def download_action(args: argparse.Namespace) -> int:
     jobs = []
     ret_val = 0
     ret_val |= create_dl_jobs(args.node, args.path, args.times, args.remove_source_files,
-                              excl_re, jobs)
+                              excl_re, jobs, special = args.special)
 
     ql = QueuedLoader(args.max_connections, args.print_progress, args.max_retries)
     ql.add_jobs(jobs)
@@ -1464,6 +1480,7 @@ def get_parser() -> tuple:
                            help='remove local files on successful upload or if a remote file'
                                 ' of the same size exists in the upload path or'
                                 ' -d is used and a duplicate exists')
+    upload_sp.add_argument("--special", help="prepends magic bytes", action='store_true')
     quiet.attach(upload_sp)
     upload_sp.add_argument('path', nargs='+', help='a path to a local file or directory')
     upload_sp.add_argument('parent', default='/', help='remote parent folder')
@@ -1498,6 +1515,7 @@ def get_parser() -> tuple:
     download_sp.add_argument('node')
     download_sp.add_argument('path', nargs='?', default=None,
                              help='local download directory [optional]')
+    download_sp.add_argument("--special", help="removes magic header bytes", action='store_true')    
     download_sp.set_defaults(func=download_action)
 
     cat_sp = subparsers.add_parser('cat', help='output a file to the standard output stream\n\n')
